@@ -1,0 +1,449 @@
+import asyncio
+import logging
+import aiosqlite
+import aiohttp
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+# ==================== BOT VA ADMIN SOZLAMALARI ====================
+BOT_TOKEN = "8956452771:AAHw85voamc0lkzRg2BniLicrO2AP--rG5k"
+ADMIN_IDS = [8318241400]
+
+# Majburiy obuna bo'ladigan kanal
+REQUIRED_CHANNELS = [
+    {
+        "id": -1003940243822,
+        "link": "https://t.me/anizone_2",
+        "name": "AniZone"
+    }
+]
+
+# Loggingni sozlash
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Bot va Dispetcher obyektlari
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ==================== FSM HOLATLAR ====================
+class BotStates(StatesGroup):
+    waiting_search = State()
+    waiting_broadcast = State()
+
+
+# ==================== MA'LUMOTLAR BAZASI (SQLITE) ====================
+async def init_db():
+    async with aiosqlite.connect("anime_bot.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_banned INTEGER DEFAULT 0
+            )
+        """)
+        await db.commit()
+    logger.info("Ma'lumotlar bazasi tayyor: anime_bot.db")
+
+async def add_user(user_id: int, username: str, full_name: str):
+    async with aiosqlite.connect("anime_bot.db") as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+            (user_id, username or "", full_name or "")
+        )
+        await db.commit()
+
+async def get_users_count():
+    async with aiosqlite.connect("anime_bot.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def get_all_users():
+    async with aiosqlite.connect("anime_bot.db") as db:
+        async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+
+# ==================== TUGMALAR (INLINE KEYBOARDS) ====================
+def main_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton(text="🔍 Anime Qidirish", callback_data="search_anime"),
+            InlineKeyboardButton(text="🎲 Tasodifiy Anime", callback_data="random_anime")
+        ],
+        [
+            InlineKeyboardButton(text="🏆 Top Anime", callback_data="top_anime"),
+            InlineKeyboardButton(text="📺 Ongoing", callback_data="ongoing")
+        ],
+        [
+            InlineKeyboardButton(text="👤 Profil", callback_data="profile"),
+            InlineKeyboardButton(text="ℹ️ Yordam", callback_data="help")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def back_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_main")]
+    ])
+
+def subscribe_keyboard():
+    buttons = []
+    for ch in REQUIRED_CHANNELS:
+        buttons.append([InlineKeyboardButton(text=f"📢 {ch['name']}", url=ch['link'])])
+    buttons.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ==================== MAJBURIY OBUNANI TEKSHIRISH ====================
+async def check_subscription(user_id: int) -> bool:
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            logger.warning(f"Kanal obunasini tekshirishda xatolik: {e}")
+            return False
+    return True
+
+
+# ==================== ANIME API (JIKAN.MOE) ====================
+async def search_anime(query: str, limit: int = 5):
+    url = f"https://api.jikan.moe/v4/anime?q={query}&limit={limit}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("data", [])
+    except Exception as e:
+        logger.error(f"Search API xatosi: {e}")
+    return []
+
+async def get_random_anime():
+    url = "https://api.jikan.moe/v4/random/anime"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("data")
+    except Exception as e:
+        logger.error(f"Random API xatosi: {e}")
+    return None
+
+async def get_top_anime(limit: int = 10):
+    url = f"https://api.jikan.moe/v4/top/anime?limit={limit}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("data", [])
+    except Exception as e:
+        logger.error(f"Top API xatosi: {e}")
+    return []
+
+def format_anime(anime: dict) -> str:
+    title = anime.get("title", "Noma'lum")
+    title_jp = anime.get("title_japanese", "")
+    score = anime.get("score") or "—"
+    episodes = anime.get("episodes") or "?"
+    status = anime.get("status", "—")
+    year = anime.get("year") or "—"
+    genres = ", ".join([g["name"] for g in anime.get("genres", [])][:4]) or "—"
+    synopsis = (anime.get("synopsis") or "Tavsif mavjud emas")[:300] + "..."
+
+    text = f"""
+<b>🎌 {title}</b>
+{f'<i>{title_jp}</i>' if title_jp else ''}
+
+⭐ <b>Reyting:</b> {score}
+📺 <b>Epizodlar soni:</b> {episodes}
+📅 <b>Yil:</b> {year}
+🟢 <b>Status:</b> {status}
+🎭 <b>Janr:</b> {genres}
+
+📝 <b>Tavsif:</b>
+{synopsis}
+"""
+    return text.strip()
+
+
+# ==================== BOT HANDLERLARI ====================
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    await add_user(user.id, user.username, user.full_name)
+
+    is_subscribed = await check_subscription(user.id)
+    if not is_subscribed:
+        await message.answer(
+            "<b>🔐 Majburiy obuna</b>\n\n"
+            "Botdan to'liq foydalanish uchun rasmiy kanalimizga obuna bo‘ling:",
+            reply_markup=subscribe_keyboard()
+        )
+        return
+
+    await message.answer(
+        f"<b>✨ Assalomu alaykum, {user.first_name}!</b>\n\n"
+        "Men <b>AniZone</b> professional Anime Botiman 🎌\n"
+        "Quyidagi menyudan foydalaning:",
+        reply_markup=main_menu()
+    )
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_callback(callback: CallbackQuery):
+    if await check_subscription(callback.from_user.id):
+        await callback.message.edit_text(
+            f"<b>✅ Obuna tasdiqlandi!</b>\n\n"
+            f"Xush kelibsiz, <b>{callback.from_user.first_name}</b>! 🎉\n"
+            f"Menyudan birini tanlang:",
+            reply_markup=main_menu()
+        )
+    else:
+        await callback.answer("❌ Kanalga hali obuna bo‘lmadingiz! Iltimos, obuna bo‘ling.", show_alert=True)
+
+@dp.callback_query(F.data == "back_main")
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>🏠 Asosiy menyu</b>\n\nQuyidagilardan birini tanlang:",
+        reply_markup=main_menu()
+    )
+
+@dp.callback_query(F.data == "search_anime")
+async def search_anime_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔍 <b>Anime qidirish</b>\n\nIltimos, anime nomini yozib yuboring (masalan: <i>Naruto</i>, <i>Attack on Titan</i>, <i>Solo Leveling</i>):",
+        reply_markup=back_button()
+    )
+    await state.set_state(BotStates.waiting_search)
+
+@dp.message(BotStates.waiting_search)
+async def process_search(message: Message, state: FSMContext):
+    query = message.text.strip()
+    status_msg = await message.answer("⏳ Qidirilmoqda...")
+
+    results = await search_anime(query)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    if not results:
+        await message.answer(
+            f"❌ '<b>{query}</b>' bo‘yicha hech qanday anime topilmadi.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        return
+
+    for anime in results[:4]:
+        text = format_anime(anime)
+        image = anime.get("images", {}).get("jpg", {}).get("large_image_url")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 MyAnimeList da ko'rish", url=anime.get("url", "https://myanimelist.net"))]
+        ])
+        if image:
+            try:
+                await message.answer_photo(photo=image, caption=text, reply_markup=keyboard)
+            except Exception:
+                await message.answer(text, reply_markup=keyboard)
+        else:
+            await message.answer(text, reply_markup=keyboard)
+
+    await message.answer("🔍 Yana qidirish yoki menyuga qaytish uchun:", reply_markup=main_menu())
+    await state.clear()
+
+@dp.callback_query(F.data == "random_anime")
+async def random_anime_handler(callback: CallbackQuery):
+    await callback.message.edit_text("🎲 Tasodifiy anime tanlanmoqda...")
+    anime = await get_random_anime()
+    if not anime:
+        await callback.message.edit_text("❌ Xatolik yuz berdi. Qayta urinib ko'ring.", reply_markup=main_menu())
+        return
+
+    text = format_anime(anime)
+    image = anime.get("images", {}).get("jpg", {}).get("large_image_url")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Yana tasodifiy", callback_data="random_anime")],
+        [InlineKeyboardButton(text="🌐 MyAnimeList", url=anime.get("url", "https://myanimelist.net"))],
+        [InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_main")]
+    ])
+
+    if image:
+        try:
+            await callback.message.delete()
+            await callback.message.answer_photo(photo=image, caption=text, reply_markup=keyboard)
+        except Exception:
+            await callback.message.edit_text(text, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "top_anime")
+async def top_anime_handler(callback: CallbackQuery):
+    await callback.message.edit_text("🏆 Top animelar ro'yxati yuklanmoqda...")
+    animes = await get_top_anime(10)
+    if not animes:
+        await callback.message.edit_text("❌ Ma'lumot olib bo'lmadi.", reply_markup=main_menu())
+        return
+
+    text = "<b>🏆 TOP 10 Eng Mashhur Animelar</b>\n\n"
+    for i, anime in enumerate(animes, 1):
+        score = anime.get("score") or "—"
+        text += f"{i}. <b>{anime.get('title')}</b> — ⭐ {score}\n"
+
+    await callback.message.edit_text(text, reply_markup=back_button())
+
+@dp.callback_query(F.data == "ongoing")
+async def ongoing_handler(callback: CallbackQuery):
+    await callback.message.edit_text("📺 Ongoing (hozirgi mavsum) animelar yuklanmoqda...")
+    url = "https://api.jikan.moe/v4/seasons/now?limit=10"
+    animes = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    animes = data.get("data", [])
+    except Exception as e:
+        logger.error(f"Ongoing API xatosi: {e}")
+
+    if not animes:
+        await callback.message.edit_text("❌ Ongoing ma'lumotlarini yuklab bo'lmadi.", reply_markup=main_menu())
+        return
+
+    text = "<b>📺 Hozirgi Mavsum (Ongoing Animelar):</b>\n\n"
+    for i, anime in enumerate(animes, 1):
+        score = anime.get("score") or "—"
+        text += f"{i}. <b>{anime.get('title')}</b> (⭐ {score})\n"
+
+    await callback.message.edit_text(text, reply_markup=back_button())
+
+@dp.callback_query(F.data == "profile")
+async def profile_handler(callback: CallbackQuery):
+    user = callback.from_user
+    count = await get_users_count()
+    is_admin = user.id in ADMIN_IDS
+
+    text = f"""
+<b>👤 Sizning profilingiz</b>
+
+🆔 ID: <code>{user.id}</code>
+👤 Ism: {user.full_name}
+📱 Username: @{user.username or 'yo‘q'}
+👑 Maqom: {'Bosh Admin' if is_admin else 'Foydalanuvchi'}
+
+📊 Botdagi jami a'zolar: <b>{count}</b> ta
+"""
+    await callback.message.edit_text(text, reply_markup=back_button())
+
+@dp.callback_query(F.data == "help")
+async def help_handler(callback: CallbackQuery):
+    text = """
+<b>ℹ️ AniZone Bot Qo'llanmasi</b>
+
+🔍 <b>Anime Qidirish</b> — O'zingizga qiziq bo'lgan har qanday animeni qidirish
+🎲 <b>Tasodifiy Anime</b> — Nima ko'rishni bilmasangiz, tasodifiy ajoyib tavsiya
+🏆 <b>Top Anime</b> — Dunyo reytingidagi TOP 10 ta anime
+📺 <b>Ongoing</b> — Hozirda efirga uzatilayotgan yangi seriyalar
+
+Savollar yoki takliflar bo'lsa, adminga murojaat qiling!
+"""
+    await callback.message.edit_text(text, reply_markup=back_button())
+
+
+# ==================== ADMIN BUYRUQLARI ====================
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    count = await get_users_count()
+    text = f"""
+<b>🛠 AniZone Bot Admin Paneli</b>
+
+👤 Admin ID: <code>{message.from_user.id}</code>
+👥 Jami foydalanuvchilar: <b>{count}</b> ta
+
+<b>Mavjud buyruqlar:</b>
+/broadcast — Barcha a'zolarga xabar yuborish
+/stats — Bot statistikasi
+"""
+    await message.answer(text)
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    count = await get_users_count()
+    await message.answer(f"📊 <b>AniZone Bot statistikasi:</b>\n👥 Jami foydalanuvchilar: <b>{count}</b> ta")
+
+@dp.message(Command("broadcast"))
+async def broadcast_start(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("📢 <b>Barcha foydalanuvchilarga yubormoqchi bo‘lgan xabaringizni yozing:</b>\n(Bekor qilish uchun /cancel deb yozing)")
+    await state.set_state(BotStates.waiting_broadcast)
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        await message.answer("❌ Amaliyot bekor qilindi.", reply_markup=main_menu())
+
+@dp.message(BotStates.waiting_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    users = await get_all_users()
+    success = 0
+    fail = 0
+
+    status_msg = await message.answer(f"🚀 Xabar tarqatilmoqda... ({len(users)} ta foydalanuvchiga)")
+
+    for user_id in users:
+        try:
+            await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+            await asyncio.sleep(0.05)  # Telegram flood limitiga qarshi
+        except Exception:
+            fail += 1
+
+    await status_msg.edit_text(f"✅ <b>Natija:</b>\n\nYuborildi: {success} ta\nYetib bormadi: {fail} ta")
+    await state.clear()
+
+
+# ==================== BOTNI ISHGA TUSHIRISH ====================
+async def main():
+    await init_db()
+    logger.info("Bot ma'lumotlari tekshirilmoqda...")
+    bot_info = await bot.get_me()
+    logger.info(f"Bot muvaffaqiyatli ishga tushdi: @{bot_info.username} ({bot_info.first_name})")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot to'xtatildi.")
